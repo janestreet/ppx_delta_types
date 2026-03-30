@@ -1,0 +1,445 @@
+"ppx_delta_types: only write down what changed"
+===============================================
+
+<!--
+Prelude for code
+
+```ocaml
+open! Base
+```
+-->
+
+Delta types are the changes you need to make to modify one type into
+another. `ppx_delta_types` lets you write down these changes as code
+instead of copying the previous version of the type and making the
+changes yourself.
+
+Using delta types instead of copying the type saves everyone time:
+
+- It reduces the work of merge conflicts. To resolve a merge conflict
+    with delta types, you keep both versions. The two type changes
+    automatically get combined.
+
+- It reduces the work of creating a new stable version in the first
+    place. With delta types, all you need to write down is the changes
+    you would like to make.
+
+- It reduces file size and [improves readability](#improvements-to-readability).
+    The total file size of a stable type definition using delta types
+    is proportional to the size of the type *plus* the number of
+    changes, rather than the size of the type *times* the number of
+    changes.
+
+Suppose we're keeping track of toil we need to do. We'll register this
+stable toil type with `ppx_delta_types` by writing `%delta_knot`.
+
+```ocaml
+module V1 = struct
+  type%delta_knot toil = (* %delta_knot registers this type but doesn't change it *)
+    | Wait_for_hydra
+    | Make_new_stable_types
+    | Archive_noisy_emails
+end
+```
+
+We now decide to change our stable type by appending a new version
+module below the first one. With delta types, the new version module
+only needs a pair of lines. We write `%delta` to indicate that the type
+should be applied as a difference onto the most-recent registered
+type.
+
+```ocaml
+# module V2 = struct
+    type%delta toil = (* %delta says this delta should be applied onto a previous type *)
+      | Understand_ppxes [@before Wait_for_hydra] (* [@before] controls the position *)
+      | Make_new_stable_types [@remove] (* [@remove] removes the constructor *)
+  end
+module V2 :
+  sig
+    type toil = Understand_ppxes | Wait_for_hydra | Archive_noisy_emails
+  end
+```
+
+Writing these two modules with delta types is equivalent to writing
+the following vanilla stable types:
+
+```ocaml
+module V1 = struct
+  type toil =
+    | Wait_for_hydra
+    | Make_new_stable_types
+    | Archive_noisy_emails
+end
+
+module V2 = struct
+  type toil =
+    | Understand_ppxes
+    | Wait_for_hydra
+    | Archive_noisy_emails
+end
+```
+
+By default, any constructor included in the delta is added at the end
+of the type. We can reinterpret the change by adding `[@before]`,
+`[@after]`, `[@modify]`, or `[@remove]`
+[annotations](#types-of-modifications), or by making the type of a
+record field be `[%remove]`.
+
+From here, I'd recommend jumping around the documentation:
+
+- [Example code](https://github.com/janestreet/ppx_delta_types/blob/master/examples/example_variant.ml)
+- [Real-world example code](https://github.com/janestreet/bonsai_web_components/blob/master/byo_panel_config/byo_panel_config.ml)
+- [Features](#features)
+    - [Integration with `ppx_stable`](#integration-with-ppx_stable):
+      you can automatically generate conversion functions.
+    - [Incremental adoption](#incremental-adoption):
+      you can get started easily by adding delta-types incrementally.
+    - [Types of modifications](#types-of-modifications):
+      you can do any type modification you need with delta-types.
+    - [Choosing where to apply the delta](#choosing-where-to-apply-the-delta):
+      you can control which type your delta type is applied to.
+    - [Stable types in decreasing order](#stable-types-in-decreasing-order):
+      you can still use delta types if your hierarchy is in reverse.
+- [Safety](#safety)
+
+
+# Features
+
+## Integration with `ppx_stable`
+
+We have first-class support for generating converters with
+`ppx_stable`. You won't need to include any of the change arguments
+(`~add`, `~modify`, etc.) because `ppx_delta_types` will infer them
+from your annotations and pass them to `ppx_stable` invisibly. You'll
+still need to specify the `~version` to convert with because
+`ppx_delta_types` doesn't know the module path to the previous type.
+
+```ocaml
+module V1 = struct
+  type%delta_knot t = { make : string }
+end
+
+let plane : V1.t = { make = "Airbus" }
+
+module V2 = struct
+  type%delta t = { model : string }
+  [@@deriving stable_record ~version:V1.t]
+end
+
+let plane = V2.of_V1_t plane ~model:"A321"
+```
+
+## Incremental adoption
+
+You only need to modify a single line of your existing code to start
+using delta types. Suppose you have some stable type hierarchy to
+which you want to add a new version.
+
+```ocaml
+module Stable = struct
+  (* ... lots of old versions *)
+  module V15 = struct
+    type t =
+      { number_of_workers : int
+      (* ... lots of fields *)
+      }
+      [@@deriving sexp]
+  end
+end
+```
+
+We can incrementally introduce delta-types to this stable hierarchy by
+adding `%delta_knot` to register the last version with delta-types.
+Then, we can use delta types to define our newest protocol version.
+Adding `%delta_knot` to a type does not affect its definition at all.
+
+```ocaml
+module Stable = struct
+  (* ... lots of old versions *)
+  module V15 = struct
+    type%delta_knot t =
+      { number_of_workers : int
+      (* ... lots of fields *)
+      }
+      [@@deriving sexp]
+  end
+
+  module V16 = struct
+    type%delta t =
+      { max_worker_size : int
+      }
+      [@@deriving sexp, stable_record ~version:V15.t]
+  end
+end
+```
+
+
+## Types of modifications
+
+In these example modifications, I'm writing all of the types at the
+top-level. In your actual code, each type will probably appear in its
+own version module and refer to the type from the previous module.
+
+```ocaml
+type%delta_knot meal = { toast : bool }
+```
+
+### Adding fields
+
+When adding fields we can also specify their orderings.
+
+```ocaml
+# type%delta meal =
+    { oatmeal : bool [@before toast]
+    ; walnuts : bool
+    ; melon : bool [@after toast]
+    }
+type meal = { oatmeal : bool; walnuts : bool; toast : bool; melon : bool; }
+```
+
+Walnuts come after oatmeal because fields get added after the
+most-recent modification (or appended at the end if this is the first
+change).
+
+### Modifying fields
+
+Modifying the types of fields happens in place
+by default, but you can move modified fields by adding annotations.
+
+```ocaml
+# type%delta meal =
+    { melon : bool [@after toast] [@modify]
+    ; walnuts : [ `Chopped | `Halved ] [@modify]
+    }
+type meal = {
+  oatmeal : bool;
+  walnuts : [ `Chopped | `Halved ];
+  toast : bool;
+  melon : bool;
+}
+```
+
+Changing whether a field is optional is a simple kind of modification.
+
+```ocaml
+# type%delta meal = { melon : bool option [@modify] }
+type meal = {
+  oatmeal : bool;
+  walnuts : [ `Chopped | `Halved ];
+  toast : bool;
+  melon : bool option;
+}
+```
+
+### Removing fields
+
+Change the type of a field to `[%remove]`
+or annotate a constructor with `[@remove]` to remove it.
+
+```ocaml
+# type%delta meal =
+    { oatmeal : [%remove]
+    ; toast : [%remove]
+    }
+type meal = { walnuts : [ `Chopped | `Halved ]; melon : bool option; }
+```
+
+### Renaming fields
+
+It's easy to rename fields in-place by deleting and re-adding them
+
+```ocaml
+# type%delta meal =
+    { melon : [%remove]; raisins : bool option }
+type meal = { walnuts : [ `Chopped | `Halved ]; raisins : bool option; }
+```
+
+## Choosing where to apply the delta
+
+`ppx_delta_types` registers your types to determine on which type to
+apply the delta. It will choose the last registered type that
+
+- is defined before the delta type
+- has the same type name as the delta type
+- has a matching `[@@delta_types.id]` annotation
+
+The need for `[@@id]`s comes up when you have multiple submodules each
+containing a `t` in a single version module. The intention is for the
+id annotation to contain a semantic module path to the stable type.
+
+```ocaml
+module V1 = struct
+  module Food = struct
+    type%delta_knot t = Kelp
+    [@@delta_types.id Food]
+  end
+
+  module Friends = struct
+    type%delta_knot t = Nemo | Dory
+    [@@delta_types.id Friends]
+  end
+end
+```
+
+If we didn't have the `[@@delta_types.id]` annotations in there, bad
+things could happen:
+
+<!--
+Register this type to be able to write the bad case.
+```ocaml
+type%delta_knot t = Nemo | Dory
+```
+-->
+
+```ocaml
+# module V2 = struct
+    module Food = struct
+      type%delta t = Sea_grass
+    end
+
+    module Friends = V1.Friends
+  end
+module V2 :
+  sig
+    module Food : sig type t = Nemo | Dory | Sea_grass end
+    module Friends = V1.Friends
+  end
+```
+
+
+With the annotations, we get the behavior we want:
+
+```ocaml
+# module V2 = struct
+    module Food = struct
+      type%delta t = Sea_grass
+      [@@delta_types.id Food]
+    end
+
+    module Friends = V1.Friends
+  end
+module V2 :
+  sig
+    module Food : sig type t = Kelp | Sea_grass end
+    module Friends = V1.Friends
+  end
+```
+
+## Stable types in decreasing order
+
+Delta types also supports having your latest version first in the
+file. It's a bit less safe and ergonomic than having the latest
+version last, but still works.
+
+The [example code](https://github.com/janestreet/ppx_delta_types/blob/master/examples/example_variant.ml)
+has both directions fully expanded with a description of tradeoffs.
+
+For a brief overview, suppose you start with a stable hierarchy:
+
+```ocaml
+module V4 = struct
+  type%delta_knot meal =
+    { raisins : bool
+    ; walnuts : [ `Chopped | `Halved ]
+    }
+end
+
+module V3 = struct
+  type%delta meal =
+    { raisins : [%remove]
+    ; melon : bool
+    }
+end
+```
+
+To add a new version to your type, you rename the latest version
+module to the next version, make your changes there, and then write
+down the delta containing the inverse of your changes.
+
+```diff
+- module V4 = struct
++ module V5 = struct
+    type%delta_knot meal =
+      { raisins : bool
+      ; walnuts : [ `Chopped | `Halved ]
++     ; mnms : int
+      }
+  end
++
++ module V4 = struct
++   type%delta meal = { mnms : [%remove] }
++ end
+```
+
+Because we added `mnms` here, we need to make the delta `[%remove]`
+them.
+
+We need bin-digest tests in this arrangement. Each time we add a new
+version, we need to make two independent modifications that must be
+inverses. If we accidentally fail to make them inverses, all of our
+old stable types will be invisibly wrong. The bin-digest tests catch
+that mistake.
+
+## Improvements to readability
+
+Not having your full stable types in your file helps readability
+because it focuses your attention on the relevant parts of your code:
+the changes. The thing to care about most in a protocol is that your
+message arrives intact at your intended destination. Having a full
+type definition tells you irrelevant information about the transport
+mechanism.
+
+Instead, the places most likely to corrupt your information are your
+conversion functions. By minimizing the repeated code in your stable
+type definitions, delta-types highlights the code used for
+conversions. Using delta-types gets the unchanging stuff out of your
+way so you can focus on getting the conversions right.
+
+# Safety
+
+You might be concerned about maintaining your protocol stability when
+your type definitions no longer appear fully-formed in any source
+file. Using bin_prot and `ppx_sexp` ties protocol specifications to
+the type definitions of stable types. By removing parts of these type
+definitions from source files, delta-types introduces a risk that
+protocol specs might change without an obvious change in the source.
+Then, two binaries at different revisions could crash after
+negotiating what they thought was a common protocol.
+
+A combination of other factors maintains safety without needing the
+full protocol written out.
+
+- bin_digest tests check that old versions of your type don't change
+- type equalities between protocol types and in-memory model types
+  check that the newest protocol version has the desired form
+
+Bin_digest tests look like this one:
+
+```ocaml skip
+let%expect_test _ =
+  print_endline [%bin_digest: t];
+  [%expect {| 16cf2d57734a4d5ff14df769827c9290 |}]
+;;
+```
+
+These tests verify that the shape of your digested type doesn't
+change. The original purpose of these tests was to ensure that your
+constituents don't change out from under you. Though not its original
+purpose, we can also use this test to check that the order and
+presence of the fields (or constructors) doesn't change accidentally.
+
+We often have a type equality between our stable protocol type and the
+in-memory model type. If this model type is exposed in the .mli, the
+compiler will check that our protocol type has the correct shape. If
+we don't want to expose our model type, we can instead use a type
+redefinition to check the same property. Either way, we ensure that
+our newest type is how we expect.
+
+```ocaml skip
+type t = Stable.V3.t = Foo of int
+```
+
+Also, This equality check at the newest version is an inexhaustive but
+useful check that older versions haven't changed. It's unlikely that
+an old version changed but the intervening delta types somehow kept
+the same result.

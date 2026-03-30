@@ -1,0 +1,7 @@
+(library
+ (name ppx_delta_types)
+ (kind ppx_rewriter)
+ (public_name ppx_delta_types)
+ (libraries base ppx_stable ppxlib)
+ (preprocess
+  (pps ppxlib.metaquot)))

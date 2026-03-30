@@ -1,0 +1,6 @@
+(library
+ (name ppx_delta_types_examples)
+ (public_name ppx_delta_types.examples)
+ (libraries core)
+ (preprocess
+  (pps ppx_jane -compare-require-explicit-locality ppx_delta_types)))
